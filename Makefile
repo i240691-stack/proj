@@ -15,5 +15,5 @@ hip: hip/hip.cpp
 asp: asp/asp.cpp
 	$(CXX) $(CXXFLAGS) asp/*.cpp -o $@ $(LIBS)
 clean:
-	rm -f arbiter hip asp
+	rm -f ./arbiter ./hip ./asp
 .PHONY: all clean
