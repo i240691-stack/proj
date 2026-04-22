@@ -441,7 +441,7 @@ void player_heal(int player_id) {
     
     std::cout << "Player " << player_id << " heals for " << (player->hp - old_hp) << " HP!" << std::endl;
 }
-
+//wwww
 void player_skip(int player_id) {
     Entity* player = &game_state->players[player_id];
     player->stamina = player->max_stamina / 2;
