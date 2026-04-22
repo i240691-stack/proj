@@ -1,0 +1,7 @@
+# requirements.txt
+# List any EXTRA apt packages your code needs beyond the Dockerfile defaults.
+# Leave blank (or with comments only) if nothing extra is required.
+#
+# Example:
+# libboost-all-dev
+# libjpeg-dev
