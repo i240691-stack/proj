@@ -1,352 +1,241 @@
-#include <iostream>
-#include <fstream>
-#include <string>
+/*
+ * asp.cpp — Automated Strategic Process
+ *
+ * Struct layout MUST be byte-for-byte identical to arbiter.cpp and hip.cpp.
+ * Key: uses EnemyAction + enemy_action_mutex (NOT PlayerCommand/cmd_mutex).
+ *
+ * §2 compliance: ASP NEVER writes game state directly.
+ *   It posts an EnemyAction to gs->enemy_action and waits.
+ *   The arbiter reads it, applies it, and clears active_enemy_turn.
+ *
+ * §2 threading: one dedicated pthread per NPC enemy.
+ * §5 signals: SIGUSR2 = stun notification (async-safe flag only).
+ *             SIGSTOP/SIGCONT from arbiter for ultimate ability (§8).
+ */
+
 #include <pthread.h>
-#include <chrono>
 #include <csignal>
-#include <sys/types.h>
-#include <sys/ipc.h>
 #include <sys/shm.h>
 #include <unistd.h>
 #include <cstdlib>
 #include <ctime>
 #include <cstring>
+#include <cstdio>
 
-// Include shared structures (same as arbiter)
-const int MAX_PLAYERS = 4;
-const int MAX_ENEMIES = 9;
-const int INVENTORY_SIZE = 20;
+// ── constants (MUST match arbiter exactly) ────────────────────────────────────
+static const int   MAX_PLAYERS    = 4;
+static const int   MAX_ENEMIES    = 9;
+static const int   INVENTORY_SIZE = 20;
+static const int   STUN_DURATION  = 3;
+static const int   WEAPON_COUNT   = 9;
+static const int   MAX_LOG        = 500;
+static const key_t SHM_KEY        = 0x4352;
 
-enum EntityType {
-    ENTITY_PLAYER,
-    ENTITY_ENEMY
-};
-
+enum EntityType { ENTITY_PLAYER, ENTITY_ENEMY };
+enum GameState  { GAME_INIT, GAME_RUNNING, GAME_WIN, GAME_LOSE, GAME_QUIT };
 enum ActionType {
-    ACTION_STRIKE,
-    ACTION_EXHAUST,
-    ACTION_USE_WEAPON,
-    ACTION_SWAP_IN,
-    ACTION_HEAL,
-    ACTION_SKIP
-};
-
-enum GameState {
-    GAME_RUNNING,
-    GAME_WIN,
-    GAME_LOSE,
-    GAME_QUIT
+    ACT_NONE = 0, ACT_STRIKE, ACT_EXHAUST, ACT_USE_WEAPON,
+    ACT_SWAP_IN, ACT_HEAL, ACT_SKIP, ACT_ULTIMATE,
+    ACT_PICKUP_ECLIPSE, ACT_QUIT, ACT_STUN_ENEMY
 };
 
 struct Weapon {
     char name[32];
-    int slot_size;
-    int damage;
-    int is_artifact;
+    int  slot_size, damage, is_artifact;
+};
+
+static const Weapon WEAPON_TABLE[WEAPON_COUNT] = {
+    {"Solar Core",    10, 95, 1}, {"Lunar Blade",   10, 90, 2},
+    {"Iron Halberd",   7, 55, 0}, {"Venom Dagger",   4, 30, 0},
+    {"Thunderstaff",   6, 50, 0}, {"Obsidian Axe",   5, 45, 0},
+    {"Frostbow",       6, 48, 0}, {"Splinter Stick",  2, 12, 0},
+    {"Eclipse Relic",  5, 60, 3},
 };
 
 struct Entity {
-    int id;
+    int        id;
     EntityType type;
-    int hp;
-    int max_hp;
-    int damage;
-    int speed;
-    int stamina;
-    int max_stamina;
-    int is_stunned;
-    int stun_end_time;
-    Weapon inventory[INVENTORY_SIZE];
-    int inventory_count;
-    Weapon* long_term_storage[50];
-    int storage_count;
-    int is_alive;
+    int        hp, max_hp, damage, speed, stamina, max_stamina, is_stunned;
+    time_t     stun_end_time;
+    int        inv_weapon[INVENTORY_SIZE];
+    Weapon     long_term_storage[50];
+    int        storage_count, is_alive;
 };
 
+// ── EnemyAction channel (ASP writes, arbiter reads and applies) ───────────────
+struct EnemyAction {
+    volatile int pending;
+    int          enemy_id;
+    ActionType   action;        // ACT_STRIKE, ACT_SKIP, or ACT_STUN_ENEMY
+    int          target_player;
+};
+
+// ── SharedGameState: byte-for-byte identical to arbiter and hip ───────────────
 struct SharedGameState {
-    GameState game_state;
-    Entity players[MAX_PLAYERS];
-    Entity enemies[MAX_ENEMIES];
-    int player_count;
-    int enemy_count;
-    int active_player_turn;
-    int active_enemy_turn;
-    int total_enemies_killed;
-    time_t game_start_time;
-    
-    Weapon solar_core;
-    Weapon lunar_blade;
-    Weapon eclipse_relic;
-    int eclipse_relic_exists;
-    int solar_core_holder;
-    int lunar_blade_holder;
-    int eclipse_relic_holder;
-    
-    char action_log[1000][256];
-    int log_count;
+    volatile int    ready;
+    int             game_state;
+    Entity          players[MAX_PLAYERS];
+    Entity          enemies[MAX_ENEMIES];
+    int             player_count, enemy_count;
+    int             active_player_turn, active_enemy_turn;
+    int             total_enemies_killed;
+    time_t          game_start_time;
+    time_t          last_stamina_update_time;
+    int             solar_core_holder, lunar_blade_holder;
+    int             eclipse_relic_holder, eclipse_relic_exists;
+    int             waiting_for_solar, waiting_for_lunar;
+    volatile int    asp_paused, ultimate_active;
+    pid_t           asp_pid, hip_pid;
+    EnemyAction     enemy_action;       // ASP writes here; arbiter applies
+    volatile int    drop_pending;
+    int             drop_weapon_idx;
+    volatile int    drop_response;
+    pthread_mutex_t state_mutex;
+    pthread_mutex_t artifact_mutex;
+    pthread_mutex_t log_mutex;
+    pthread_mutex_t enemy_action_mutex; // protects enemy_action channel
+    char            action_log[MAX_LOG][128];
+    int             log_count;
 };
 
-// Global variables
-int shmid;
-SharedGameState* game_state = nullptr;
-pthread_t enemy_threads[MAX_ENEMIES];
-volatile bool running = true;
-volatile bool process_paused = false;
+// ── globals ───────────────────────────────────────────────────────────────────
+static int              shmid   = -1;
+static SharedGameState *gs      = nullptr;
+static volatile int     running = 1;
+static pthread_t        enemy_threads[MAX_ENEMIES];
 
-// Function prototypes
-void attach_shared_memory();
-void signal_handler(int sig);
-void* enemy_thread(void* arg);
-void handle_enemy_ai(int enemy_id);
-ActionType decide_enemy_action(int enemy_id);
-int select_player_target();
-void enemy_strike(int enemy_id, int target_player);
-void enemy_skip(int enemy_id);
-void log_action(const char* message);
+// ── async-signal-safe stun flag (§5) ─────────────────────────────────────────
+static volatile sig_atomic_t stun_received = 0;
 
-int main() {
-    std::cout << "=== CHRONO RIFT - AUTOMATED STRATEGIC PROCESS ===" << std::endl;
-    std::cout << "ASP PID: " << getpid() << std::endl;
-    
-    // Set up signal handlers
-    signal(SIGTERM, signal_handler);
-    signal(SIGUSR1, signal_handler);  // For pause/resume
-    signal(SIGUSR2, signal_handler);  // For stun
-    
-    try {
-        // Attach to shared memory
-        attach_shared_memory();
-        
-        // Get enemy count
-        int enemy_count = game_state->enemy_count;
-        std::cout << "Starting " << enemy_count << " enemy threads" << std::endl;
-        
-        // Create one thread per enemy
-        for (int i = 0; i < enemy_count; i++) {
-            int* enemy_id = new int(i);
-            if (pthread_create(&enemy_threads[i], nullptr, enemy_thread, enemy_id) != 0) {
-                perror("pthread_create");
-                exit(1);
-            }
-        }
-        
-        // Main process loop - just wait for termination
-        while (running) {
-            sleep(1);
-        }
-        
-        // Join all enemy threads
-        for (int i = 0; i < enemy_count; i++) {
-            pthread_join(enemy_threads[i], nullptr);
-        }
-        
-    } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+// ── signal handlers — flag only (§5 async-safe) ───────────────────────────────
+static void sigusr2_handler(int) { stun_received = 1; }
+static void sigterm_handler(int) { running = 0; }
+// SIGSTOP / SIGCONT: sent by arbiter for ultimate ability (§8)
+// No handler needed — kernel pauses/resumes the whole process automatically.
+
+// ── shared memory ─────────────────────────────────────────────────────────────
+static void attach_shared_memory() {
+    for (;;) {
+        shmid = shmget(SHM_KEY, sizeof(SharedGameState), 0666);
+        if (shmid != -1) break;
+        usleep(50000);
     }
-    
-    // Cleanup
-    if (game_state != nullptr) {
-        shmdt(game_state);
-    }
-    
-    std::cout << "Automated Strategic Process terminated" << std::endl;
-    return 0;
+    gs = (SharedGameState *)shmat(shmid, nullptr, 0);
+    if (gs == (void *)-1) { perror("shmat asp"); _exit(1); }
+    while (gs->ready == 0) usleep(50000);
 }
 
-void attach_shared_memory() {
-    key_t key = ftok(".", 'S');
-    if (key == -1) {
-        perror("ftok");
-        exit(1);
+// ── post action to arbiter (§2: ASP never writes game state directly) ─────────
+// Spin-waits if previous action not yet consumed (should be instant).
+// Then waits for arbiter to clear active_enemy_turn (confirming applied).
+static void post_enemy_action(int eid, ActionType action, int target) {
+    // Wait for any previous action to be consumed
+    for (;;) {
+        pthread_mutex_lock(&gs->enemy_action_mutex);
+        if (!gs->enemy_action.pending) break;
+        pthread_mutex_unlock(&gs->enemy_action_mutex);
+        usleep(5000);
+        if (!running || gs->game_state != GAME_RUNNING) return;
     }
-    
-    shmid = shmget(key, sizeof(SharedGameState), 0666);
-    if (shmid == -1) {
-        perror("shmget");
-        exit(1);
-    }
-    
-    game_state = (SharedGameState*)shmat(shmid, nullptr, 0);
-    if (game_state == (void*)-1) {
-        perror("shmat");
-        exit(1);
-    }
-    
-    std::cout << "Shared memory attached at address: " << game_state << std::endl;
+    gs->enemy_action.enemy_id      = eid;
+    gs->enemy_action.action        = action;
+    gs->enemy_action.target_player = target;
+    gs->enemy_action.pending       = 1;
+    pthread_mutex_unlock(&gs->enemy_action_mutex);
+
+    // Wait until arbiter applies the action and clears our turn
+    while (gs->active_enemy_turn == eid && gs->game_state == GAME_RUNNING)
+        usleep(10000);
 }
 
-void* enemy_thread(void* arg) {
-    int enemy_id = *(int*)arg;
-    delete (int*)arg;
-    
-    std::cout << "Enemy " << enemy_id << " thread started (TID: " << pthread_self() << ")" << std::endl;
-    
-    while (running) {
-        // Check if process is paused (for ultimate ability)
-        if (process_paused) {
-            sleep(1);
-            continue;
-        }
-        
-        // Check if it's this enemy's turn
-        int is_my_turn = (game_state->active_enemy_turn == enemy_id);
-        GameState current_state = game_state->game_state;
-        
-        // Check if enemy is alive and not stunned
-        int is_alive = game_state->enemies[enemy_id].is_alive;
-        int is_stunned = game_state->enemies[enemy_id].is_stunned;
-        
-        if (current_state != GAME_RUNNING) {
-            break;
-        }
-        
-        if (!is_alive) {
-            // Enemy is dead, thread waits
-            sleep(1);
-            continue;
-        }
-        
-        if (is_stunned) {
-            // Enemy is stunned, thread waits
-            sleep(1);
-            continue;
-        }
-        
-        if (is_my_turn) {
-            // It's this enemy's turn - handle AI
-            handle_enemy_ai(enemy_id);
-        } else {
-            // Not this enemy's turn - wait
-            usleep(100000); // 100ms
-        }
+// ── AI decision ───────────────────────────────────────────────────────────────
+static void enemy_take_turn(int eid) {
+    // Read-only snapshot of alive players (no lock needed — only arbiter writes)
+    int alive[MAX_PLAYERS]; int cnt = 0;
+    for (int i = 0; i < gs->player_count; i++)
+        if (gs->players[i].is_alive) alive[cnt++] = i;
+
+    if (cnt == 0) {
+        post_enemy_action(eid, ACT_SKIP, -1);
+        return;
     }
-    
-    std::cout << "Enemy " << enemy_id << " thread terminated" << std::endl;
+
+    // AI: 10% stun a player, 65% strike, 25% skip
+    int roll = rand() % 100;
+    if (roll < 10) {
+        // Stun attack — arbiter will apply the stun and send SIGUSR1 to HIP (§5)
+        int target = alive[rand() % cnt];
+        post_enemy_action(eid, ACT_STUN_ENEMY, target);
+    } else if (roll < 75) {
+        int target = alive[rand() % cnt];
+        post_enemy_action(eid, ACT_STRIKE, target);
+    } else {
+        post_enemy_action(eid, ACT_SKIP, -1);
+    }
+}
+
+// ── enemy thread ──────────────────────────────────────────────────────────────
+// §2: one dedicated pthread per NPC.
+// §8: SIGSTOP freezes ALL threads in this process; SIGCONT resumes them.
+static void *enemy_thread_fn(void *arg) {
+    int eid = *(int *)arg;
+    delete (int *)arg;
+
+    while (running && gs->game_state == GAME_RUNNING) {
+
+        // Handle stun flag in thread loop — not in signal handler (async-safe §5)
+        if (stun_received) {
+            stun_received = 0;
+            // Stun state written to shm by arbiter before SIGUSR2 was sent.
+            // If it was our turn, arbiter already cleared active_enemy_turn.
+            // Just re-check loop conditions.
+            continue;
+        }
+
+        const Entity &e = gs->enemies[eid];
+        if (!e.is_alive)  { usleep(200000); continue; }
+        if (e.is_stunned) { usleep(200000); continue; }
+        if (gs->active_enemy_turn != eid) { usleep(100000); continue; }
+
+        // Thinking delay — must be well under NPC_TIMEOUT (3s) (§8)
+        usleep(400000 + rand() % 300000); // 0.4–0.7s
+
+        // Re-check after sleeping (stun/ultimate may have arrived)
+        if (gs->active_enemy_turn != eid)    continue;
+        if (gs->enemies[eid].is_stunned)     continue;
+        if (gs->game_state != GAME_RUNNING)  break;
+
+        enemy_take_turn(eid);
+    }
     return nullptr;
 }
 
-void handle_enemy_ai(int enemy_id) {
-    std::cout << "Enemy " << enemy_id << " is thinking..." << std::endl;
-    
-    // Add small delay for AI "thinking"
-    usleep(500000); // 500ms
-    
-    // Decide action
-    ActionType action = decide_enemy_action(enemy_id);
-    
-    // Execute action
-    switch (action) {
-        case ACTION_STRIKE: {
-            int target = select_player_target();
-            enemy_strike(enemy_id, target);
-            break;
-        }
-        case ACTION_SKIP:
-            enemy_skip(enemy_id);
-            break;
-        default:
-            enemy_skip(enemy_id);
-            break;
-    }
-}
+// ── main ──────────────────────────────────────────────────────────────────────
+int main() {
+    srand((unsigned)(time(nullptr) ^ getpid()));
 
-ActionType decide_enemy_action(int enemy_id) {
-    Entity* enemy = &game_state->enemies[enemy_id];
-    
-    // Simple AI: 70% chance to strike, 30% chance to skip
-    ActionType action = (rand() % 100 < 70) ? ACTION_STRIKE : ACTION_SKIP;
-    
-    return action;
-}
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = sigusr2_handler;
+    sigaction(SIGUSR2, &sa, nullptr); // stun notification (§5)
+    sa.sa_handler = sigterm_handler;
+    sigaction(SIGTERM, &sa, nullptr);
+    // SIGSTOP/SIGCONT: no handler, kernel manages for §8 ultimate
 
-int select_player_target() {
-    int alive_players[MAX_PLAYERS];
-    int alive_count = 0;
-    
-    // Find all alive players
-    for (int i = 0; i < game_state->player_count; i++) {
-        if (game_state->players[i].is_alive) {
-            alive_players[alive_count++] = i;
-        }
-    }
-    
-    int target = -1;
-    if (alive_count > 0) {
-        // Select random alive player
-        target = alive_players[rand() % alive_count];
-    }
-    
-    return target;
-}
+    attach_shared_memory();
 
-void enemy_strike(int enemy_id, int target_player) {
-    if (target_player == -1) {
-        enemy_skip(enemy_id);
-        return;
-    }
-    
-    Entity* enemy = &game_state->enemies[enemy_id];
-    Entity* player = &game_state->players[target_player];
-    
-    player->hp -= enemy->damage;
-    if (player->hp < 0) player->hp = 0;
-    enemy->stamina = 0;
-    
-    char log_msg[256];
-    sprintf(log_msg, "Enemy %d strikes Player %d for %d damage", enemy_id, target_player, enemy->damage);
-    log_action(log_msg);
-    
-    // Update shared memory
-    game_state->enemies[enemy_id] = *enemy;
-    game_state->players[target_player] = *player;
-    
-    // Clear turn
-    game_state->active_enemy_turn = -1;
-    
-    std::cout << "Enemy " << enemy_id << " strikes Player " << target_player 
-              << " for " << enemy->damage << " damage!" << std::endl;
-}
+    int ec = gs->enemy_count;
+    printf("ASP started: %d enemy thread(s)\n", ec);
+    fflush(stdout);
 
-void enemy_skip(int enemy_id) {
-    Entity* enemy = &game_state->enemies[enemy_id];
-    enemy->stamina = enemy->max_stamina / 2;
-    
-    char log_msg[256];
-    sprintf(log_msg, "Enemy %d skips turn", enemy_id);
-    log_action(log_msg);
-    
-    game_state->enemies[enemy_id] = *enemy;
-    game_state->active_enemy_turn = -1;
-    
-    std::cout << "Enemy " << enemy_id << " skips turn." << std::endl;
-}
-
-void log_action(const char* message) {
-    if (game_state->log_count < 1000) {
-        strncpy(game_state->action_log[game_state->log_count], message, 255);
-        game_state->action_log[game_state->log_count][255] = '\0';
-        game_state->log_count++;
+    for (int i = 0; i < ec; i++) {
+        int *id = new int(i);
+        pthread_create(&enemy_threads[i], nullptr, enemy_thread_fn, id);
     }
-}
 
-void signal_handler(int sig) {
-    if (sig == SIGTERM) {
-        std::cout << "ASP received SIGTERM, shutting down..." << std::endl;
-        running = false;
-    } else if (sig == SIGUSR1) {
-        static int is_paused = 0;
-        
-        if (is_paused) {
-            std::cout << "ASP resumed" << std::endl;
-            process_paused = false;
-            is_paused = 0;
-        } else {
-            std::cout << "ASP paused" << std::endl;
-            process_paused = true;
-            is_paused = 1;
-        }
-    } else if (sig == SIGUSR2) {
-        std::cout << "ASP received stun signal" << std::endl;
-        // This would handle stun logic for the appropriate enemy
-    }
+    for (int i = 0; i < ec; i++) pthread_join(enemy_threads[i], nullptr);
+
+    shmdt(gs);
+    return 0;
 }

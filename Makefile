@@ -1,19 +1,25 @@
 CXX = g++
 CXXFLAGS = -Wall -Wextra -std=c++17 -pthread
-# Uncomment the one LIBS line that matches your GUI choice:
-# LIBS = -lsfml-graphics -lsfml-window -lsfml-audio -lsfml-network -lsfml-system -lrt
-# LIBS = $(shell sdl2-config --libs) -lrt
-# LIBS = -lglfw -lGL -lrt
 LIBS = -lncurses -lrt
-TARGETS = arbiter hip asp
+
+TARGETS = bin/arbiter bin/hip bin/asp
+
 all: clean $(TARGETS)
 	@echo Build complete.
-arbiter: arbiter/arbiter.cpp
-	$(CXX) $(CXXFLAGS) arbiter/*.cpp -o $@ $(LIBS)
-hip: hip/hip.cpp
-	$(CXX) $(CXXFLAGS) hip/*.cpp -o $@ $(LIBS)
-asp: asp/asp.cpp
-	$(CXX) $(CXXFLAGS) asp/*.cpp -o $@ $(LIBS)
+
+bin/arbiter: arbiter/arbiter.cpp
+	mkdir -p bin
+	$(CXX) $(CXXFLAGS) arbiter/*.cpp -o bin/arbiter $(LIBS)
+
+bin/hip: hip/hip.cpp
+	mkdir -p bin
+	$(CXX) $(CXXFLAGS) hip/*.cpp -o bin/hip $(LIBS)
+
+bin/asp: asp/asp.cpp
+	mkdir -p bin
+	$(CXX) $(CXXFLAGS) asp/*.cpp -o bin/asp $(LIBS)
+
 clean:
-	rm -f ./arbiter ./hip ./asp
+	rm -rf bin
+
 .PHONY: all clean

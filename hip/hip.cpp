@@ -1,496 +1,174 @@
-#include <iostream>
-#include <fstream>
-#include <string>
+/*
+ * hip.cpp — Human Interfacing Process (Option A)
+ *
+ * Struct layout MUST be byte-for-byte identical to arbiter.cpp and asp.cpp.
+ * Key: uses EnemyAction + enemy_action_mutex (NOT PlayerCommand/cmd_mutex).
+ *
+ * HIP's role in Option A:
+ *   - Exists as a required separate process (§2 process isolation)
+ *   - Runs one idle thread per player character (§2 threading requirement)
+ *   - Receives SIGUSR1 (stun notification) — async-safe flag only (§5)
+ *   - Does NOT write shared state, does NOT handle input (arbiter does that)
+ */
+
 #include <pthread.h>
-#include <chrono>
 #include <csignal>
-#include <sys/types.h>
-#include <sys/ipc.h>
 #include <sys/shm.h>
 #include <unistd.h>
 #include <cstdlib>
 #include <ctime>
 #include <cstring>
+#include <cstdio>
 
-// Include shared structures (same as arbiter)
-const int MAX_PLAYERS = 4;
-const int MAX_ENEMIES = 9;
-const int INVENTORY_SIZE = 20;
+// ── constants (MUST match arbiter exactly) ────────────────────────────────────
+static const int   MAX_PLAYERS    = 4;
+static const int   MAX_ENEMIES    = 9;
+static const int   INVENTORY_SIZE = 20;
+static const int   STUN_DURATION  = 3;
+static const int   WEAPON_COUNT   = 9;
+static const int   MAX_LOG        = 500;
+static const key_t SHM_KEY        = 0x4352;
 
-enum EntityType {
-    ENTITY_PLAYER,
-    ENTITY_ENEMY
-};
-
+enum EntityType { ENTITY_PLAYER, ENTITY_ENEMY };
+enum GameState  { GAME_INIT, GAME_RUNNING, GAME_WIN, GAME_LOSE, GAME_QUIT };
 enum ActionType {
-    ACTION_STRIKE,
-    ACTION_EXHAUST,
-    ACTION_USE_WEAPON,
-    ACTION_SWAP_IN,
-    ACTION_HEAL,
-    ACTION_SKIP
-};
-
-enum GameState {
-    GAME_RUNNING,
-    GAME_WIN,
-    GAME_LOSE,
-    GAME_QUIT
+    ACT_NONE = 0, ACT_STRIKE, ACT_EXHAUST, ACT_USE_WEAPON,
+    ACT_SWAP_IN, ACT_HEAL, ACT_SKIP, ACT_ULTIMATE,
+    ACT_PICKUP_ECLIPSE, ACT_QUIT, ACT_STUN_ENEMY
 };
 
 struct Weapon {
     char name[32];
-    int slot_size;
-    int damage;
-    int is_artifact;
+    int  slot_size, damage, is_artifact;
+};
+
+static const Weapon WEAPON_TABLE[WEAPON_COUNT] = {
+    {"Solar Core",    10, 95, 1}, {"Lunar Blade",   10, 90, 2},
+    {"Iron Halberd",   7, 55, 0}, {"Venom Dagger",   4, 30, 0},
+    {"Thunderstaff",   6, 50, 0}, {"Obsidian Axe",   5, 45, 0},
+    {"Frostbow",       6, 48, 0}, {"Splinter Stick",  2, 12, 0},
+    {"Eclipse Relic",  5, 60, 3},
 };
 
 struct Entity {
-    int id;
+    int        id;
     EntityType type;
-    int hp;
-    int max_hp;
-    int damage;
-    int speed;
-    int stamina;
-    int max_stamina;
-    int is_stunned;
-    int stun_end_time;
-    Weapon inventory[INVENTORY_SIZE];
-    int inventory_count;
-    Weapon* long_term_storage[50];
-    int storage_count;
-    int is_alive;
+    int        hp, max_hp, damage, speed, stamina, max_stamina, is_stunned;
+    time_t     stun_end_time;
+    int        inv_weapon[INVENTORY_SIZE];
+    Weapon     long_term_storage[50];
+    int        storage_count, is_alive;
 };
 
+// ── EnemyAction: MUST match arbiter (NOT PlayerCommand) ──────────────────────
+struct EnemyAction {
+    volatile int pending;
+    int          enemy_id;
+    ActionType   action;
+    int          target_player;
+};
+
+// ── SharedGameState: byte-for-byte identical to arbiter ──────────────────────
 struct SharedGameState {
-    GameState game_state;
-    Entity players[MAX_PLAYERS];
-    Entity enemies[MAX_ENEMIES];
-    int player_count;
-    int enemy_count;
-    int active_player_turn;
-    int active_enemy_turn;
-    int total_enemies_killed;
-    time_t game_start_time;
-    
-    Weapon solar_core;
-    Weapon lunar_blade;
-    Weapon eclipse_relic;
-    int eclipse_relic_exists;
-    int solar_core_holder;
-    int lunar_blade_holder;
-    int eclipse_relic_holder;
-    
-    char action_log[1000][256];
-    int log_count;
+    volatile int    ready;
+    int             game_state;
+    Entity          players[MAX_PLAYERS];
+    Entity          enemies[MAX_ENEMIES];
+    int             player_count, enemy_count;
+    int             active_player_turn, active_enemy_turn;
+    int             total_enemies_killed;
+    time_t          game_start_time;
+    time_t          last_stamina_update_time;
+    int             solar_core_holder, lunar_blade_holder;
+    int             eclipse_relic_holder, eclipse_relic_exists;
+    int             waiting_for_solar, waiting_for_lunar;
+    volatile int    asp_paused, ultimate_active;
+    pid_t           asp_pid, hip_pid;
+    EnemyAction     enemy_action;       // matches arbiter
+    volatile int    drop_pending;
+    int             drop_weapon_idx;
+    volatile int    drop_response;
+    pthread_mutex_t state_mutex;
+    pthread_mutex_t artifact_mutex;
+    pthread_mutex_t log_mutex;
+    pthread_mutex_t enemy_action_mutex; // matches arbiter
+    char            action_log[MAX_LOG][128];
+    int             log_count;
 };
 
-// Global variables
-int shmid;
-SharedGameState* game_state = nullptr;
-pthread_t player_threads[MAX_PLAYERS];
-volatile bool running = true;
+// ── globals ───────────────────────────────────────────────────────────────────
+static int              shmid   = -1;
+static SharedGameState *gs      = nullptr;
+static volatile int     running = 1;
+static pthread_t        player_threads[MAX_PLAYERS];
 
-// Function prototypes
-void attach_shared_memory();
-void signal_handler(int sig);
-void* player_thread(void* arg);
-void handle_player_input(int player_id);
-void player_strike(int player_id, int target_enemy);
-void player_exhaust(int player_id, int target_enemy);
-void player_use_weapon(int player_id, int target_enemy);
-void player_swap_in(int player_id);
-void player_heal(int player_id);
-void player_skip(int player_id);
-void display_inventory(int player_id);
-void display_enemies();
+// ── async-signal-safe stun flag (§5) ─────────────────────────────────────────
+static volatile sig_atomic_t stun_received = 0;
 
-int main() {
-    std::cout << "=== CHRONO RIFT - HUMAN INTERFACING PROCESS ===" << std::endl;
-    std::cout << "HIP PID: " << getpid() << std::endl;
-    
-    // Set up signal handlers
-    signal(SIGTERM, signal_handler);
-    signal(SIGUSR1, signal_handler);  // For stun
-    
-    try {
-        // Attach to shared memory
-        attach_shared_memory();
-        
-        // Get player count
-        int player_count = game_state->player_count;
-        std::cout << "Starting " << player_count << " player threads" << std::endl;
-        
-        // Create one thread per player
-        for (int i = 0; i < player_count; i++) {
-            int* player_id = new int(i);
-            if (pthread_create(&player_threads[i], nullptr, player_thread, player_id) != 0) {
-                perror("pthread_create");
-                exit(1);
-            }
-        }
-        
-        // Main process loop - just wait for termination
-        while (running) {
-            sleep(1);
-        }
-        
-        // Join all player threads
-        for (int i = 0; i < player_count; i++) {
-            pthread_join(player_threads[i], nullptr);
-        }
-        
-    } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+// ── signal handlers — flag only, nothing else (§5 async-safe) ────────────────
+static void sigusr1_handler(int) { stun_received = 1; }
+static void sigterm_handler(int) { running = 0; }
+
+// ── shared memory ─────────────────────────────────────────────────────────────
+static void attach_shared_memory() {
+    for (;;) {
+        shmid = shmget(SHM_KEY, sizeof(SharedGameState), 0666);
+        if (shmid != -1) break;
+        usleep(50000);
     }
-    
-    // Cleanup
-    if (game_state != nullptr) {
-        shmdt(game_state);
-    }
-    
-    std::cout << "Human Interfacing Process terminated" << std::endl;
-    return 0;
+    gs = (SharedGameState *)shmat(shmid, nullptr, 0);
+    if (gs == (void *)-1) { perror("shmat hip"); _exit(1); }
+    while (gs->ready == 0) usleep(50000);
 }
 
-void attach_shared_memory() {
-    key_t key = ftok(".", 'S');
-    if (key == -1) {
-        perror("ftok");
-        exit(1);
-    }
-    
-    shmid = shmget(key, sizeof(SharedGameState), 0666);
-    if (shmid == -1) {
-        perror("shmget");
-        exit(1);
-    }
-    
-    game_state = (SharedGameState*)shmat(shmid, nullptr, 0);
-    if (game_state == (void*)-1) {
-        perror("shmat");
-        exit(1);
-    }
-    
-    std::cout << "Shared memory attached at address: " << game_state << std::endl;
-}
+// ── player thread ─────────────────────────────────────────────────────────────
+// Satisfies §2: one thread per player character.
+// Option A: arbiter handles all input. These threads just stay alive,
+// monitor for stun and game-end, and exit cleanly.
+static void *player_thread_fn(void *arg) {
+    int pid = *(int *)arg;
+    delete (int *)arg;
 
-void* player_thread(void* arg) {
-    int player_id = *(int*)arg;
-    delete (int*)arg;
-    
-    std::cout << "Player " << player_id << " thread started (TID: " << pthread_self() << ")" << std::endl;
-    
-    while (running) {
-        // Check if it's this player's turn
-        int is_my_turn = (game_state->active_player_turn == player_id);
-        GameState current_state = game_state->game_state;
-        
-        // Check if player is alive and not stunned
-        int is_alive = game_state->players[player_id].is_alive;
-        int is_stunned = game_state->players[player_id].is_stunned;
-        
-        if (current_state != GAME_RUNNING) {
-            break;
-        }
-        
-        if (!is_alive) {
-            // Player is dead, thread waits
-            sleep(1);
-            continue;
-        }
-        
-        if (is_stunned) {
-            // Player is stunned, thread waits
-            sleep(1);
-            continue;
-        }
-        
-        if (is_my_turn) {
-            // It's this player's turn - handle input
-            handle_player_input(player_id);
-        } else {
-            // Not this player's turn - wait
-            usleep(100000); // 100ms
-        }
+    while (running && gs->game_state == GAME_RUNNING) {
+        // Stun arrived — arbiter already wrote is_stunned to shm (§5)
+        // Flag lets us know it happened; no further action needed here.
+        if (stun_received) stun_received = 0;
+
+        const Entity &p = gs->players[pid];
+        if (!p.is_alive) { usleep(200000); continue; }
+
+        // Idle — arbiter drives all turns and input via ncurses (Option A)
+        usleep(100000);
     }
-    
-    std::cout << "Player " << player_id << " thread terminated" << std::endl;
     return nullptr;
 }
 
-void handle_player_input(int player_id) {
-    std::cout << "\n=== Player " << player_id << "'s Turn ===" << std::endl;
-    
-    // Display player status
-    Entity* player = &game_state->players[player_id];
-    std::cout << "HP: " << player->hp << "/" << player->max_hp 
-              << ", Stamina: " << player->stamina << "/" << player->max_stamina << std::endl;
-    
-    // Display enemies
-    display_enemies();
-    
-    // Display inventory
-    display_inventory(player_id);
-    
-    // Get user input
-    std::cout << "\nChoose action:" << std::endl;
-    std::cout << "1. Strike (Attack)" << std::endl;
-    std::cout << "2. Exhaust (Reduce stamina)" << std::endl;
-    std::cout << "3. Use Weapon" << std::endl;
-    std::cout << "4. Swap In Weapon" << std::endl;
-    std::cout << "5. Heal" << std::endl;
-    std::cout << "6. Skip Turn" << std::endl;
-    std::cout << "7. Quit Game" << std::endl;
-    std::cout << "Action: ";
-    
-    int choice;
-    std::cin >> choice;
-    
-    switch (choice) {
-        case 1: {
-            int target;
-            std::cout << "Select target enemy (0-" << game_state->enemy_count - 1 << "): ";
-            std::cin >> target;
-            player_strike(player_id, target);
-            break;
-        }
-        case 2: {
-            int target;
-            std::cout << "Select target enemy (0-" << game_state->enemy_count - 1 << "): ";
-            std::cin >> target;
-            player_exhaust(player_id, target);
-            break;
-        }
-        case 3: {
-            int weapon_idx;
-            std::cout << "Select weapon index: ";
-            std::cin >> weapon_idx;
-            
-            int target;
-            std::cout << "Select target enemy (0-" << game_state->enemy_count - 1 << "): ";
-            std::cin >> target;
-            
-            player_use_weapon(player_id, target);
-            break;
-        }
-        case 4:
-            player_swap_in(player_id);
-            break;
-        case 5:
-            player_heal(player_id);
-            break;
-        case 6:
-            player_skip(player_id);
-            break;
-        case 7:
-            // Send quit signal to arbiter
-            kill(getppid(), SIGTERM);
-            running = false;
-            break;
-        default:
-            std::cout << "Invalid choice. Skipping turn." << std::endl;
-            player_skip(player_id);
-            break;
-    }
-}
+// ── main ──────────────────────────────────────────────────────────────────────
+int main() {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sigemptyset(&sa.sa_mask);
+    sa.sa_handler = sigusr1_handler;
+    sigaction(SIGUSR1, &sa, nullptr); // stun (§5)
+    sa.sa_handler = sigterm_handler;
+    sigaction(SIGTERM, &sa, nullptr);
 
-void player_strike(int player_id, int target_enemy) {
-    if (target_enemy < 0 || target_enemy >= game_state->enemy_count || 
-        !game_state->enemies[target_enemy].is_alive) {
-        std::cout << "Invalid target!" << std::endl;
-        return;
-    }
-    
-    // Perform the action
-    Entity* player = &game_state->players[player_id];
-    Entity* enemy = &game_state->enemies[target_enemy];
-    
-    enemy->hp -= player->damage;
-    if (enemy->hp < 0) enemy->hp = 0;
-    player->stamina = 0;
-    
-    char log_msg[256];
-    sprintf(log_msg, "Player %d strikes Enemy %d for %d damage", player_id, target_enemy, player->damage);
-    
-    if (game_state->log_count < 1000) {
-        strncpy(game_state->action_log[game_state->log_count], log_msg, 255);
-        game_state->action_log[game_state->log_count][255] = '\0';
-        game_state->log_count++;
-    }
-    
-    // Check if enemy is dead
-    if (enemy->hp <= 0) {
-        enemy->hp = 0;
-        enemy->is_alive = 0;
-        game_state->total_enemies_killed++;
-    }
-    
-    // Clear turn
-    game_state->active_player_turn = -1;
-    
-    std::cout << "Player " << player_id << " strikes Enemy " << target_enemy 
-              << " for " << player->damage << " damage!" << std::endl;
-}
+    attach_shared_memory();
 
-void player_exhaust(int player_id, int target_enemy) {
-    if (target_enemy < 0 || target_enemy >= game_state->enemy_count || 
-        !game_state->enemies[target_enemy].is_alive) {
-        std::cout << "Invalid target!" << std::endl;
-        return;
-    }
-    
-    Entity* player = &game_state->players[player_id];
-    Entity* enemy = &game_state->enemies[target_enemy];
-    
-    enemy->stamina -= player->damage;
-    if (enemy->stamina < 0) enemy->stamina = 0;
-    player->stamina = 0;
-    
-    char log_msg[256];
-    sprintf(log_msg, "Player %d exhausts Enemy %d, reducing stamina by %d", player_id, target_enemy, player->damage);
-    
-    if (game_state->log_count < 1000) {
-        strncpy(game_state->action_log[game_state->log_count], log_msg, 255);
-        game_state->action_log[game_state->log_count][255] = '\0';
-        game_state->log_count++;
-    }
-    
-    game_state->active_player_turn = -1;
-    
-    std::cout << "Player " << player_id << " exhausts Enemy " << target_enemy 
-              << ", reducing stamina by " << player->damage << "!" << std::endl;
-}
+    int pc = gs->player_count;
+    printf("HIP started: %d player thread(s)\n", pc);
+    fflush(stdout);
 
-void player_use_weapon(int player_id, int target_enemy) {
-    if (target_enemy < 0 || target_enemy >= game_state->enemy_count || 
-        !game_state->enemies[target_enemy].is_alive) {
-        std::cout << "Invalid target!" << std::endl;
-        return;
+    for (int i = 0; i < pc; i++) {
+        int *id = new int(i);
+        pthread_create(&player_threads[i], nullptr, player_thread_fn, id);
     }
-    
-    Entity* player = &game_state->players[player_id];
-    Entity* enemy = &game_state->enemies[target_enemy];
-    
-    // For simplicity, use player's damage as weapon damage
-    int weapon_damage = player->damage * 2;  // Double damage for weapons
-    
-    enemy->hp -= weapon_damage;
-    if (enemy->hp < 0) enemy->hp = 0;
-    player->stamina = 0;
-    
-    char log_msg[256];
-    sprintf(log_msg, "Player %d uses weapon on Enemy %d for %d damage", player_id, target_enemy, weapon_damage);
-    
-    if (game_state->log_count < 1000) {
-        strncpy(game_state->action_log[game_state->log_count], log_msg, 255);
-        game_state->action_log[game_state->log_count][255] = '\0';
-        game_state->log_count++;
-    }
-    
-    // Check if enemy is dead
-    if (enemy->hp <= 0) {
-        enemy->hp = 0;
-        enemy->is_alive = 0;
-        game_state->total_enemies_killed++;
-    }
-    
-    game_state->active_player_turn = -1;
-    
-    std::cout << "Player " << player_id << " uses weapon on Enemy " << target_enemy 
-              << " for " << weapon_damage << " damage!" << std::endl;
-}
 
-void player_swap_in(int player_id) {
-    Entity* player = &game_state->players[player_id];
-    player->stamina = 0;
-    
-    char log_msg[256];
-    sprintf(log_msg, "Player %d swaps in weapon", player_id);
-    
-    if (game_state->log_count < 1000) {
-        strncpy(game_state->action_log[game_state->log_count], log_msg, 255);
-        game_state->action_log[game_state->log_count][255] = '\0';
-        game_state->log_count++;
-    }
-    
-    game_state->active_player_turn = -1;
-    
-    std::cout << "Player " << player_id << " swaps in weapon!" << std::endl;
-}
+    while (running && gs->game_state == GAME_RUNNING) usleep(200000);
+    running = 0;
 
-void player_heal(int player_id) {
-    Entity* player = &game_state->players[player_id];
-    int old_hp = player->hp;
-    
-    player->hp += player->max_hp * 0.1;
-    if (player->hp > player->max_hp) player->hp = player->max_hp;
-    player->stamina = 0;
-    
-    char log_msg[256];
-    sprintf(log_msg, "Player %d heals for %d HP", player_id, player->hp - old_hp);
-    
-    if (game_state->log_count < 1000) {
-        strncpy(game_state->action_log[game_state->log_count], log_msg, 255);
-        game_state->action_log[game_state->log_count][255] = '\0';
-        game_state->log_count++;
-    }
-    
-    game_state->active_player_turn = -1;
-    
-    std::cout << "Player " << player_id << " heals for " << (player->hp - old_hp) << " HP!" << std::endl;
-}
-//wwww
-void player_skip(int player_id) {
-    Entity* player = &game_state->players[player_id];
-    player->stamina = player->max_stamina / 2;
-    
-    char log_msg[256];
-    sprintf(log_msg, "Player %d skips turn", player_id);
-    
-    if (game_state->log_count < 1000) {
-        strncpy(game_state->action_log[game_state->log_count], log_msg, 255);
-        game_state->action_log[game_state->log_count][255] = '\0';
-        game_state->log_count++;
-    }
-    
-    game_state->active_player_turn = -1;
-    
-    std::cout << "Player " << player_id << " skips turn." << std::endl;
-}
+    for (int i = 0; i < pc; i++) pthread_join(player_threads[i], nullptr);
 
-void display_inventory(int player_id) {
-    Entity* player = &game_state->players[player_id];
-    std::cout << "\nInventory:" << std::endl;
-    
-    for (int i = 0; i < INVENTORY_SIZE; i++) {
-        if (player->inventory[i].name[0] != '\0') {
-            std::cout << "  [" << i << "] " << player->inventory[i].name 
-                      << " (Slots: " << player->inventory[i].slot_size 
-                      << ", Damage: " << player->inventory[i].damage << ")" << std::endl;
-        }
-    }
-}
-
-void display_enemies() {
-    std::cout << "\nEnemies:" << std::endl;
-    for (int i = 0; i < game_state->enemy_count; i++) {
-        if (game_state->enemies[i].is_alive) {
-            std::cout << "  " << i << ": HP " << game_state->enemies[i].hp 
-                      << "/" << game_state->enemies[i].max_hp 
-                      << ", Stamina " << game_state->enemies[i].stamina 
-                      << "/" << game_state->enemies[i].max_stamina << std::endl;
-        }
-    }
-}
-
-void signal_handler(int sig) {
-    if (sig == SIGTERM) {
-        std::cout << "HIP received SIGTERM, shutting down..." << std::endl;
-        running = false;
-    } else if (sig == SIGUSR1) {
-        std::cout << "HIP received stun signal" << std::endl;
-        // This would handle stun logic for the appropriate player
-    }
+    shmdt(gs);
+    return 0;
 }
