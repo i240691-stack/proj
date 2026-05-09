@@ -265,8 +265,8 @@ static void init_game() {
     gs->player_count    = pc;
     gs->game_start_time = time(nullptr);
     for (int i = 0; i < pc; i++) init_entity(&gs->players[i], ENTITY_PLAYER, i, pc);
-//    int ec = MIN_ENEMIES + rand() % (MAX_ENEMIES - MIN_ENEMIES + 1);
-int ec=1;  
+   int ec = MIN_ENEMIES + rand() % (MAX_ENEMIES - MIN_ENEMIES + 1);
+
 gs->enemy_count = ec;
     for (int i = 0; i < ec; i++) init_entity(&gs->enemies[i], ENTITY_ENEMY, i, pc);
     gs->game_state = GAME_RUNNING;
