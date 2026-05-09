@@ -1,32 +1,3 @@
-/*
- * arbiter.cpp — Game Arbiter
- *
- * ARCHITECTURE (Option A):
- *   - Arbiter owns ALL game state writes and ALL ncurses UI/input.
- *   - HIP only exists to receive SIGUSR1 (stun notification) — no input, no state writes.
- *   - ASP posts enemy actions via enemy_action channel; arbiter applies them.
- *
- * LOCK ORDER (always acquire in this order, never reverse):
- *   1. artifact_mutex
- *   2. state_mutex
- *   3. log_mutex      (standalone for log_action — never held with others)
- *   enemy_action_mutex is standalone — never held while acquiring another mutex.
- *
- * KEY FIXES APPLIED:
- *   BUG1  - render snapshots plain fields only (NOT memcpy of whole struct with mutexes)
- *   BUG2  - log_action() called only AFTER releasing state_mutex
- *   BUG3  - ACT_PICKUP_ECLIPSE acquires artifact_mutex before state_mutex
- *   BUG4  - SIGCHLD sets hip_exited/asp_exited flags; pids kept for final waitpid
- *   BUG5  - inp_read_int releases render_mutex before blocking on wgetnstr
- *   BUG6  - enemy_action read under enemy_action_mutex
- *   BUG7  - ASP no longer writes state; uses enemy_action channel
- *   BUG8  - only arbiter handles input (Option A); HIP has no input loop
- *   BUG9  - drop prompt only in arbiter; removed from HIP
- *   BUG10 - drop_response initialized to -1 before setting drop_pending=1
- *   WARN1 - check_stun_recovery under state_mutex
- *   WARN2 - active_enemy_turn cleared before SIGSTOP
- */
-
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -53,7 +24,7 @@ static const int   NPC_TIMEOUT        = 3;
 static const int   WEAPON_COUNT       = 9;
 static const int   MAX_LOG            = 500;
 static const key_t SHM_KEY            = 0x4352;
-static const int   ROLL_NO            = 1234; // ← replace with your roll number
+static const int   ROLL_NO            = 699; // ← replace with your roll number
 
 // ── enums ─────────────────────────────────────────────────────────────────────
 enum EntityType { ENTITY_PLAYER, ENTITY_ENEMY };
@@ -294,8 +265,9 @@ static void init_game() {
     gs->player_count    = pc;
     gs->game_start_time = time(nullptr);
     for (int i = 0; i < pc; i++) init_entity(&gs->players[i], ENTITY_PLAYER, i, pc);
-    int ec = MIN_ENEMIES + rand() % (MAX_ENEMIES - MIN_ENEMIES + 1);
-    gs->enemy_count = ec;
+//    int ec = MIN_ENEMIES + rand() % (MAX_ENEMIES - MIN_ENEMIES + 1);
+int ec=1;  
+gs->enemy_count = ec;
     for (int i = 0; i < ec; i++) init_entity(&gs->enemies[i], ENTITY_ENEMY, i, pc);
     gs->game_state = GAME_RUNNING;
     gs->ready      = 1;
@@ -1112,6 +1084,29 @@ static void check_game_conditions() {
     for (int i = 0; i < gs->player_count; i++) if (gs->players[i].is_alive) alive_p++;
     int kills = gs->total_enemies_killed;
     int state = gs->game_state;
+    
+    // Check if all enemies are dead and spawn new wave
+    int alive_e = 0;
+    for (int i = 0; i < gs->enemy_count; i++) if (gs->enemies[i].is_alive) alive_e++;
+    
+    if (alive_e == 0 && kills < 10) {
+        // Spawn new enemy wave
+        int new_count = MIN_ENEMIES + rand() % (MAX_ENEMIES - MIN_ENEMIES + 1);
+        gs->enemy_count = new_count;
+        for (int i = 0; i < new_count; i++) init_entity(&gs->enemies[i], ENTITY_ENEMY, i, gs->player_count);
+        char spawn_msg[128];
+        snprintf(spawn_msg, sizeof(spawn_msg), "NEW WAVE: %d enemies spawned!", new_count);
+        log_action(spawn_msg);
+        
+        // Restart ASP process for new enemy threads
+        if (gs->asp_pid > 0) {
+            kill(gs->asp_pid, SIGTERM);
+            waitpid(gs->asp_pid, nullptr, 0);
+            gs->asp_pid = fork();
+            if (gs->asp_pid == 0) { execl("./asp","asp",nullptr); perror("execl asp"); exit(1); }
+        }
+    }
+    
     pthread_mutex_unlock(&gs->state_mutex);
     if (state != GAME_RUNNING) return;
     if (alive_p == 0) { gs->game_state = GAME_LOSE; log_action("ALL PLAYERS DEAD — DEFEAT"); }

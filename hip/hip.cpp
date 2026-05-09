@@ -1,15 +1,3 @@
-/*
- * hip.cpp — Human Interfacing Process (Option A)
- *
- * Struct layout MUST be byte-for-byte identical to arbiter.cpp and asp.cpp.
- * Key: uses EnemyAction + enemy_action_mutex (NOT PlayerCommand/cmd_mutex).
- *
- * HIP's role in Option A:
- *   - Exists as a required separate process (§2 process isolation)
- *   - Runs one idle thread per player character (§2 threading requirement)
- *   - Receives SIGUSR1 (stun notification) — async-safe flag only (§5)
- *   - Does NOT write shared state, does NOT handle input (arbiter does that)
- */
 
 #include <pthread.h>
 #include <csignal>

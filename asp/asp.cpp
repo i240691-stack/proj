@@ -1,18 +1,3 @@
-/*
- * asp.cpp — Automated Strategic Process
- *
- * Struct layout MUST be byte-for-byte identical to arbiter.cpp and hip.cpp.
- * Key: uses EnemyAction + enemy_action_mutex (NOT PlayerCommand/cmd_mutex).
- *
- * §2 compliance: ASP NEVER writes game state directly.
- *   It posts an EnemyAction to gs->enemy_action and waits.
- *   The arbiter reads it, applies it, and clears active_enemy_turn.
- *
- * §2 threading: one dedicated pthread per NPC enemy.
- * §5 signals: SIGUSR2 = stun notification (async-safe flag only).
- *             SIGSTOP/SIGCONT from arbiter for ultimate ability (§8).
- */
-
 #include <pthread.h>
 #include <csignal>
 #include <sys/shm.h>
